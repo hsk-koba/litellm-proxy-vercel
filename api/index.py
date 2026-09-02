@@ -1,54 +1,43 @@
 import os
-from flask import Flask, request, jsonify, Response
 import json
 import time
+from flask import Flask, request, jsonify, Response
 from litellm import Router
 
 app = Flask(__name__)
 
 # --- 1. Router のモデルリスト定義 ---
 model_list = [
-    # Opus級: NVIDIA NIM Kimi K3
     {
         "model_name": "opus",
         "litellm_params": {
             "model": "nvidia_nim/moonshotai/kimi-k3",
             "api_base": "https://integrate.api.nvidia.com/v1",
             "api_key": os.environ.get("NVIDIA_API_KEY"),
-            "reasoning_effort": "high",
+            "extra_body": {"chat_template_kwargs": {"thinking": False}}
         },
-        "model_info": {
-            "allowed_fails": 1,
-            "cooldown_time": 60
-        }
+        "model_info": {"allowed_fails": 1, "cooldown_time": 60}
     },
-    # Sonnet級: NVIDIA NIM Nemotron Ultra
     {
         "model_name": "sonnet",
         "litellm_params": {
             "model": "nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b",
             "api_base": "https://integrate.api.nvidia.com/v1",
             "api_key": os.environ.get("NVIDIA_API_KEY"),
+            "extra_body": {"chat_template_kwargs": {"thinking": False}}
         },
-        "model_info": {
-            "allowed_fails": 1,
-            "cooldown_time": 60
-        }
+        "model_info": {"allowed_fails": 1, "cooldown_time": 60}
     },
-    # Sonnet障害時の中間レーン
     {
         "model_name": "nemotron-super",
         "litellm_params": {
             "model": "nvidia_nim/nvidia/nemotron-3-super-120b-a12b",
             "api_base": "https://integrate.api.nvidia.com/v1",
             "api_key": os.environ.get("NVIDIA_API_KEY"),
+            "extra_body": {"chat_template_kwargs": {"thinking": False}}
         },
-        "model_info": {
-            "allowed_fails": 1,
-            "cooldown_time": 60
-        }
+        "model_info": {"allowed_fails": 1, "cooldown_time": 60}
     },
-    # Haiku級
     {
         "model_name": "haiku",
         "litellm_params": {
@@ -56,14 +45,10 @@ model_list = [
             "api_base": "https://integrate.api.nvidia.com/v1",
             "api_key": os.environ.get("NVIDIA_API_KEY"),
         },
-        "model_info": {
-            "allowed_fails": 1,
-            "cooldown_time": 60
-        }
+        "model_info": {"allowed_fails": 1, "cooldown_time": 60}
     }
 ]
 
-# --- 2. フォールバック設定 ---
 fallbacks = [
     {"opus": ["sonnet", "nemotron-super", "haiku"]},
     {"sonnet": ["nemotron-super", "haiku"]},
@@ -81,14 +66,22 @@ def check_auth():
     return auth_header == master_key
 
 def clean_content(content):
-    """Claude 形式の複雑な content (list/dict) を OpenAI 互換の文字列に変換"""
+    """Tool Call を維持しつつ content を OpenAI/NVIDIA 互換形式にサニタイズ"""
     if isinstance(content, str):
         return content
     elif isinstance(content, list):
         text_parts = []
         for item in content:
-            if isinstance(item, dict) and item.get("type") == "text":
-                text_parts.append(item.get("text", ""))
+            if isinstance(item, dict):
+                # 通常テキスト
+                if item.get("type") == "text":
+                    text_parts.append(item.get("text", ""))
+                # Tool Use (ツール呼び出し)
+                elif item.get("type") == "tool_use":
+                    text_parts.append(f"[Tool Call: {item.get('name')} {json.dumps(item.get('input', {}))}]")
+                # Tool Result (ツール実行結果)
+                elif item.get("type") == "tool_result":
+                    text_parts.append(f"[Tool Result: {item.get('content')}]")
             elif isinstance(item, str):
                 text_parts.append(item)
         return "\n".join(text_parts)
@@ -116,7 +109,6 @@ def handle_messages_request(data):
         content = clean_content(msg.get("content", ""))
         formatted_messages.append({"role": role, "content": content})
 
-    # バックエンドモデルの呼び出し
     response = router.completion(
         model=target_model,
         messages=formatted_messages,
@@ -124,12 +116,8 @@ def handle_messages_request(data):
         drop_params=True
     )
 
-    # -----------------------------------------------------------
-    # 1. ストリーミング応答 (Claude Code SSE 形式へ変換)
-    # -----------------------------------------------------------
     if stream:
         def generate():
-            # 必須: message_start イベント
             msg_start = {
                 "type": "message_start",
                 "message": {
@@ -145,7 +133,6 @@ def handle_messages_request(data):
             }
             yield f"event: message_start\ndata: {json.dumps(msg_start)}\n\n"
             
-            # 必須: content_block_start イベント
             block_start = {
                 "type": "content_block_start",
                 "index": 0,
@@ -153,10 +140,18 @@ def handle_messages_request(data):
             }
             yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
 
-            # チャンクごとのテキスト出力
             for chunk in response:
+                delta_text = ""
                 try:
-                    delta_text = chunk.choices[0].delta.content or ""
+                    choice = chunk.choices[0]
+                    delta = choice.delta
+                    
+                    if hasattr(delta, "content") and delta.content:
+                        delta_text = delta.content
+                    elif hasattr(delta, "reasoning_content") and delta.reasoning_content:
+                        delta_text = delta.reasoning_content
+                    elif isinstance(delta, dict):
+                        delta_text = delta.get("content") or delta.get("reasoning_content") or ""
                 except Exception:
                     delta_text = ""
 
@@ -168,7 +163,6 @@ def handle_messages_request(data):
                     }
                     yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
 
-            # 必須: content_block_stop & message_stop イベント
             yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
             
             msg_delta = {
@@ -179,11 +173,17 @@ def handle_messages_request(data):
             yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
             yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
-        return Response(generate(), mimetype="text/event-stream")
+        return Response(
+            generate(),
+            mimetype="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
 
-    # -----------------------------------------------------------
-    # 2. 一括レスポンス応答 (Anthropic API 形式へ変換)
-    # -----------------------------------------------------------
+    # 一括レスポンス
     try:
         content_text = response.choices[0].message.content or ""
     except Exception:
@@ -194,12 +194,7 @@ def handle_messages_request(data):
         "type": "message",
         "role": "assistant",
         "model": requested_model or "claude-3-5-sonnet-20241022",
-        "content": [
-            {
-                "type": "text",
-                "text": content_text
-            }
-        ],
+        "content": [{"type": "text", "text": content_text}],
         "stop_reason": "end_turn",
         "stop_sequence": None,
         "usage": {
@@ -207,9 +202,7 @@ def handle_messages_request(data):
             "output_tokens": getattr(response, "usage", {}).get("completion_tokens", 0) if hasattr(response, "usage") else 0
         }
     }
-
     return jsonify(anthropic_response), 200
-
 
 @app.route("/", methods=["GET"])
 @app.route("/health", methods=["GET"])
@@ -229,14 +222,12 @@ def claude_messages():
 def catch_all(path):
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-    
     if request.method == "POST":
         try:
             return handle_messages_request(request.get_json() or {})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
-            
     return jsonify({"status": "healthy", "path_received": path}), 200
-# WSGI エントリポイント
+
 if __name__ == "__main__":
     app.run(port=8000, debug=True)
