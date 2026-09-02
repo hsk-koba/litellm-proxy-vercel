@@ -1,5 +1,6 @@
 import os
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
+import json:wq
 from litellm import Router
 
 app = Flask(__name__)
@@ -68,28 +69,91 @@ fallbacks = [
     {"nemotron-super": ["haiku"]}
 ]
 
-# ルーター初期化
-router = Router(
-    model_list=model_list,
-    fallbacks=fallbacks,
-    num_retries=0,
-    timeout=120
-)
+router = Router(model_list=model_list, fallbacks=fallbacks, num_retries=0, timeout=120)
 
-# --- 認証ミドルウェア関数 ---
 def check_auth():
     master_key = os.environ.get("LITELLM_MASTER_KEY")
     if not master_key:
-        return True  # マスターキー未設定の場合は通過させる（テスト用）
-
-    auth_header = request.headers.get("Authorization", "")
-    expected_header = f"Bearer {master_key}"
+        return True
     
-    if auth_header != expected_header:
-        return False
-    return True
+    # x-api-key (Anthropic形式) または Authorization (OpenAI形式) を両方チェック
+    auth_header = request.headers.get("x-api-key") or request.headers.get("Authorization", "")
+    auth_header = auth_header.replace("Bearer ", "").strip()
+    return auth_header == master_key
+
+# --- エンドポイント設定 ---
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({"status": "running", "message": "LiteLLM Router for Claude Code"}), 200
+
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+# 1. Claude Code が呼び出す Anthropic Messages API (/v1/messages)
+@app.route("/v1/messages", methods=["POST"])
+def claude_messages():
+    if not check_auth():
+        return jsonify({"error": {"type": "authentication_error", "message": "Invalid API Key"}}), 401
+
+    data = request.get_json() or {}
+    
+    # Claude Code 側からのモデル名要求（例: claude-3-5-sonnet...）をプロキシ内のエイリアスに変換
+    requested_model = data.get("model", "").lower()
+    if "opus" in requested_model:
+        target_model = "opus"
+    elif "haiku" in requested_model:
+        target_model = "haiku"
+    else:
+        target_model = "sonnet"  # デフォルトは sonnet にルーティング
+
+    messages = data.get("messages", [])
+    system_prompt = data.get("system")
+    stream = data.get("stream", False)
+
+    # system プロンプトが存在する場合は messages の先頭に追加
+    formatted_messages = []
+    if system_prompt:
+        if isinstance(system_prompt, list):
+            system_content = "\n".join([s.get("text", "") for s in system_prompt if isinstance(s, dict)])
+        else:
+            system_content = str(system_prompt)
+        formatted_messages.append({"role": "system", "content": system_content})
+
+    formatted_messages.extend(messages)
+
+    try:
+        response = router.completion(
+            model=target_model,
+            messages=formatted_messages,
+            stream=stream,
+            drop_params=True
+        )
+
+        # ストリーミング (SSE) 応答
+        if stream:
+            def generate():
+                for chunk in response:
+                    chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
+                    yield f"data: {json.dumps(chunk_dict)}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return Response(
+                generate(),
+                mimetype="text/event-stream",
+                headers={"X-Accel-Buffering": "no"}
+            )
+
+        # 通常一括応答
+        res_dict = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+        return jsonify(res_dict), 200
+
+    except Exception as e:
+        return jsonify({"error": {"type": "api_error", "message": str(e)}}), 500
 
 
+# 2. OpenAI 互換クライアント用 (/v1/chat/completions)
 @app.route("/v1/chat/completions", methods=["POST"])
 def chat_completions():
     if not check_auth():
@@ -100,9 +164,6 @@ def chat_completions():
     messages = data.get("messages", [])
     stream = data.get("stream", False)
 
-    if not messages:
-        return jsonify({"error": "messages is required"}), 400
-
     try:
         response = router.completion(
             model=model,
@@ -111,42 +172,16 @@ def chat_completions():
             drop_params=True
         )
 
-        # --------------------------------------------------
-        # 1. ストリーミング処理 (stream=True)
-        # --------------------------------------------------
         if stream:
             def generate():
                 for chunk in response:
-                    # LiteLLM の Chunk オブジェクトを dict 化
-                    if hasattr(chunk, "model_dump"):
-                        chunk_dict = chunk.model_dump()
-                    else:
-                        chunk_dict = dict(chunk)
-                    
-                    # SSE 形式 (data: {JSON}\n\n) で出力
+                    chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
                     yield f"data: {json.dumps(chunk_dict)}\n\n"
-                
-                # OpenAI 互換の終了シグナル
                 yield "data: [DONE]\n\n"
 
-            return Response(
-                generate(),
-                mimetype="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"  # バッファリングを無効化
-                }
-            )
+            return Response(generate(), mimetype="text/event-stream")
 
-        # --------------------------------------------------
-        # 2. 一括レスポンス処理 (stream=False)
-        # --------------------------------------------------
-        if hasattr(response, "model_dump"):
-            res_dict = response.model_dump()
-        else:
-            res_dict = dict(response)
-
+        res_dict = response.model_dump() if hasattr(response, "model_dump") else dict(response)
         return jsonify(res_dict), 200
 
     except Exception as e:
