@@ -75,118 +75,98 @@ def check_auth():
     master_key = os.environ.get("LITELLM_MASTER_KEY")
     if not master_key:
         return True
-    
-    # x-api-key (Anthropic形式) または Authorization (OpenAI形式) を両方チェック
     auth_header = request.headers.get("x-api-key") or request.headers.get("Authorization", "")
     auth_header = auth_header.replace("Bearer ", "").strip()
     return auth_header == master_key
 
-# --- エンドポイント設定 ---
+def clean_content(content):
+    """Claude 形式の複雑な content (list/dict) を OpenAI 互換の文字列に変換"""
+    if isinstance(content, str):
+        return content
+    elif isinstance(content, list):
+        text_parts = []
+        for item in content:
+            if isinstance(item, dict) and item.get("type") == "text":
+                text_parts.append(item.get("text", ""))
+            elif isinstance(item, str):
+                text_parts.append(item)
+        return "\n".join(text_parts)
+    return str(content)
 
-@app.route("/", methods=["GET"])
-def index():
-    return jsonify({"status": "running", "message": "LiteLLM Router for Claude Code"}), 200
-
-@app.route("/health", methods=["GET"])
-def health():
-    return jsonify({"status": "healthy"}), 200
-
-# 1. Claude Code が呼び出す Anthropic Messages API (/v1/messages)
-@app.route("/v1/messages", methods=["POST"])
-def claude_messages():
-    if not check_auth():
-        return jsonify({"error": {"type": "authentication_error", "message": "Invalid API Key"}}), 401
-
-    data = request.get_json() or {}
-    
-    # Claude Code 側からのモデル名要求（例: claude-3-5-sonnet...）をプロキシ内のエイリアスに変換
+def handle_messages_request(data):
     requested_model = data.get("model", "").lower()
     if "opus" in requested_model:
         target_model = "opus"
     elif "haiku" in requested_model:
         target_model = "haiku"
     else:
-        target_model = "sonnet"  # デフォルトは sonnet にルーティング
+        target_model = "sonnet"
 
-    messages = data.get("messages", [])
+    raw_messages = data.get("messages", [])
     system_prompt = data.get("system")
     stream = data.get("stream", False)
 
-    # system プロンプトが存在する場合は messages の先頭に追加
     formatted_messages = []
+    
+    # System プロンプトの追加
     if system_prompt:
-        if isinstance(system_prompt, list):
-            system_content = "\n".join([s.get("text", "") for s in system_prompt if isinstance(s, dict)])
-        else:
-            system_content = str(system_prompt)
-        formatted_messages.append({"role": "system", "content": system_content})
+        formatted_messages.append({
+            "role": "system",
+            "content": clean_content(system_prompt)
+        })
 
-    formatted_messages.extend(messages)
+    # 各メッセージのフォーマット整形
+    for msg in raw_messages:
+        role = msg.get("role", "user")
+        content = clean_content(msg.get("content", ""))
+        formatted_messages.append({"role": role, "content": content})
 
-    try:
-        response = router.completion(
-            model=target_model,
-            messages=formatted_messages,
-            stream=stream,
-            drop_params=True
-        )
+    response = router.completion(
+        model=target_model,
+        messages=formatted_messages,
+        stream=stream,
+        drop_params=True
+    )
 
-        # ストリーミング (SSE) 応答
-        if stream:
-            def generate():
-                for chunk in response:
-                    chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
-                    yield f"data: {json.dumps(chunk_dict)}\n\n"
-                yield "data: [DONE]\n\n"
+    if stream:
+        def generate():
+            for chunk in response:
+                chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
+                yield f"data: {json.dumps(chunk_dict)}\n\n"
+            yield "data: [DONE]\n\n"
 
-            return Response(
-                generate(),
-                mimetype="text/event-stream",
-                headers={"X-Accel-Buffering": "no"}
-            )
+        return Response(generate(), mimetype="text/event-stream")
 
-        # 通常一括応答
-        res_dict = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-        return jsonify(res_dict), 200
-
-    except Exception as e:
-        return jsonify({"error": {"type": "api_error", "message": str(e)}}), 500
+    res_dict = response.model_dump() if hasattr(response, "model_dump") else dict(response)
+    return jsonify(res_dict), 200
 
 
-# 2. OpenAI 互換クライアント用 (/v1/chat/completions)
-@app.route("/v1/chat/completions", methods=["POST"])
-def chat_completions():
+@app.route("/", methods=["GET"])
+@app.route("/health", methods=["GET"])
+def health():
+    return jsonify({"status": "healthy"}), 200
+
+@app.route("/v1/messages", methods=["POST"])
+def claude_messages():
     if not check_auth():
         return jsonify({"error": "Unauthorized"}), 401
-
-    data = request.get_json() or {}
-    model = data.get("model", "opus")
-    messages = data.get("messages", [])
-    stream = data.get("stream", False)
-
     try:
-        response = router.completion(
-            model=model,
-            messages=messages,
-            stream=stream,
-            drop_params=True
-        )
-
-        if stream:
-            def generate():
-                for chunk in response:
-                    chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
-                    yield f"data: {json.dumps(chunk_dict)}\n\n"
-                yield "data: [DONE]\n\n"
-
-            return Response(generate(), mimetype="text/event-stream")
-
-        res_dict = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-        return jsonify(res_dict), 200
-
+        return handle_messages_request(request.get_json() or {})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+@app.route("/<path:path>", methods=["GET", "POST"])
+def catch_all(path):
+    if not check_auth():
+        return jsonify({"error": "Unauthorized"}), 401
+    
+    if request.method == "POST":
+        try:
+            return handle_messages_request(request.get_json() or {})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+            
+    return jsonify({"status": "healthy", "path_received": path}), 200
 # WSGI エントリポイント
 if __name__ == "__main__":
     app.run(port=8000, debug=True)
