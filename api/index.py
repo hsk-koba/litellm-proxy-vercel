@@ -107,20 +107,15 @@ def handle_messages_request(data):
     stream = data.get("stream", False)
 
     formatted_messages = []
-    
-    # System プロンプトの追加
     if system_prompt:
-        formatted_messages.append({
-            "role": "system",
-            "content": clean_content(system_prompt)
-        })
+        formatted_messages.append({"role": "system", "content": clean_content(system_prompt)})
 
-    # 各メッセージのフォーマット整形
     for msg in raw_messages:
         role = msg.get("role", "user")
         content = clean_content(msg.get("content", ""))
         formatted_messages.append({"role": role, "content": content})
 
+    # バックエンドモデルの呼び出し
     response = router.completion(
         model=target_model,
         messages=formatted_messages,
@@ -128,17 +123,91 @@ def handle_messages_request(data):
         drop_params=True
     )
 
+    # -----------------------------------------------------------
+    # 1. ストリーミング応答 (Claude Code SSE 形式へ変換)
+    # -----------------------------------------------------------
     if stream:
         def generate():
+            # 必須: message_start イベント
+            msg_start = {
+                "type": "message_start",
+                "message": {
+                    "id": f"msg_{int(time.time())}",
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": requested_model or "claude-3-5-sonnet-20241022",
+                    "stop_reason": None,
+                    "stop_sequence": None,
+                    "usage": {"input_tokens": 10, "output_tokens": 1}
+                }
+            }
+            yield f"event: message_start\ndata: {json.dumps(msg_start)}\n\n"
+            
+            # 必須: content_block_start イベント
+            block_start = {
+                "type": "content_block_start",
+                "index": 0,
+                "content_block": {"type": "text", "text": ""}
+            }
+            yield f"event: content_block_start\ndata: {json.dumps(block_start)}\n\n"
+
+            # チャンクごとのテキスト出力
             for chunk in response:
-                chunk_dict = chunk.model_dump() if hasattr(chunk, "model_dump") else dict(chunk)
-                yield f"data: {json.dumps(chunk_dict)}\n\n"
-            yield "data: [DONE]\n\n"
+                try:
+                    delta_text = chunk.choices[0].delta.content or ""
+                except Exception:
+                    delta_text = ""
+
+                if delta_text:
+                    delta_event = {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "text_delta", "text": delta_text}
+                    }
+                    yield f"event: content_block_delta\ndata: {json.dumps(delta_event)}\n\n"
+
+            # 必須: content_block_stop & message_stop イベント
+            yield f"event: content_block_stop\ndata: {json.dumps({'type': 'content_block_stop', 'index': 0})}\n\n"
+            
+            msg_delta = {
+                "type": "message_delta",
+                "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                "usage": {"output_tokens": 100}
+            }
+            yield f"event: message_delta\ndata: {json.dumps(msg_delta)}\n\n"
+            yield f"event: message_stop\ndata: {json.dumps({'type': 'message_stop'})}\n\n"
 
         return Response(generate(), mimetype="text/event-stream")
 
-    res_dict = response.model_dump() if hasattr(response, "model_dump") else dict(response)
-    return jsonify(res_dict), 200
+    # -----------------------------------------------------------
+    # 2. 一括レスポンス応答 (Anthropic API 形式へ変換)
+    # -----------------------------------------------------------
+    try:
+        content_text = response.choices[0].message.content or ""
+    except Exception:
+        content_text = ""
+
+    anthropic_response = {
+        "id": f"msg_{int(time.time())}",
+        "type": "message",
+        "role": "assistant",
+        "model": requested_model or "claude-3-5-sonnet-20241022",
+        "content": [
+            {
+                "type": "text",
+                "text": content_text
+            }
+        ],
+        "stop_reason": "end_turn",
+        "stop_sequence": None,
+        "usage": {
+            "input_tokens": getattr(response, "usage", {}).get("prompt_tokens", 0) if hasattr(response, "usage") else 0,
+            "output_tokens": getattr(response, "usage", {}).get("completion_tokens", 0) if hasattr(response, "usage") else 0
+        }
+    }
+
+    return jsonify(anthropic_response), 200
 
 
 @app.route("/", methods=["GET"])
