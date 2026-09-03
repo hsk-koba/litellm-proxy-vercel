@@ -1,0 +1,52 @@
+# LiteLLM Proxy configuration. Secrets are injected at container runtime.
+model_list:
+  - model_name: opus
+    litellm_params:
+      model: nvidia_nim/moonshotai/kimi-k3
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_API_KEY
+      reasoning_effort: high
+    model_info:
+      allowed_fails: 1
+      cooldown_time: 60
+
+  - model_name: sonnet
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-ultra-550b-a55b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_API_KEY
+    model_info:
+      allowed_fails: 1
+      cooldown_time: 60
+
+  - model_name: nemotron-super
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3-super-120b-a12b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_API_KEY
+    model_info:
+      allowed_fails: 1
+      cooldown_time: 60
+
+  - model_name: haiku
+    litellm_params:
+      model: nvidia_nim/nvidia/nemotron-3.5-lightning-30b-a3b
+      api_base: https://integrate.api.nvidia.com/v1
+      api_key: os.environ/NVIDIA_API_KEY
+    model_info:
+      allowed_fails: 1
+      cooldown_time: 60
+
+router_settings:
+  num_retries: 0
+  timeout: 120
+  fallbacks:
+    - opus: [sonnet, nemotron-super, haiku]
+    - sonnet: [nemotron-super, haiku]
+    - nemotron-super: [haiku]
+
+litellm_settings:
+  drop_params: true
+
+general_settings:
+  master_key: os.environ/LITELLM_MASTER_KEY
